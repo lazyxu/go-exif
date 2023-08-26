@@ -3,17 +3,16 @@ package exif
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 
-	"encoding/binary"
-	"io/ioutil"
+	log "github.com/dsoprea/go-logging"
 
-	"github.com/dsoprea/go-logging"
-
-	"github.com/dsoprea/go-exif/v3/common"
+	exifcommon "github.com/dsoprea/go-exif/v3/common"
 )
 
 const (
@@ -170,6 +169,116 @@ func searchAndExtractExifWithReaderWithDiscarded(r io.Reader) (rawExif []byte, d
 	log.PanicIf(err)
 
 	return rawExif, discarded, nil
+}
+
+type ReadAtSeeker interface {
+	io.ReaderAt
+	io.Seeker
+}
+type ReaderSeekerWithDiscarded struct {
+	r         ReadAtSeeker
+	discarded int64
+	off       int64
+}
+
+func (rs *ReaderSeekerWithDiscarded) Read(b []byte) (n int, err error) {
+	n, err = rs.r.ReadAt(b, rs.discarded+rs.off)
+	rs.off += int64(n)
+	rs.r.Seek(int64(n), io.SeekCurrent)
+	return
+}
+
+func (rs *ReaderSeekerWithDiscarded) Seek(offset int64, whence int) (ret int64, err error) {
+	switch whence {
+	case io.SeekStart:
+		ret, err = rs.r.Seek(rs.discarded+offset, whence)
+	case io.SeekCurrent:
+		ret, err = rs.r.Seek(offset, whence)
+	case io.SeekEnd:
+		ret, err = rs.r.Seek(offset, whence)
+	default:
+		return 0, errors.New("ReaderSeekerWithDiscarded.Seek: invalid whence")
+	}
+	ret -= rs.discarded
+	rs.off = ret
+	return
+}
+
+// SearchAndExtractExifFromReadAtSeeker searches for an EXIF blob using an
+// `io.Reader`. We can't know how much long the EXIF data is without parsing it,
+// so this will likely grab up a lot of the image-data, too.
+func SearchAndExtractExifFromReadAtSeeker(r ReadAtSeeker) (exifReadSeeker io.ReadSeeker, err error) {
+	defer func() {
+		if state := recover(); state != nil {
+			err = log.Wrap(state.(error))
+		}
+	}()
+
+	exifReadSeeker, _, err = searchAndExtractExifFromReadAtSeeker(r)
+	if err != nil {
+		if err == ErrNoExif {
+			return nil, err
+		}
+
+		log.Panic(err)
+	}
+
+	return exifReadSeeker, nil
+}
+
+// searchAndExtractExifFromReadAtSeeker searches for an EXIF blob using
+// an `io.Reader`. We can't know how much long the EXIF data is without parsing
+// it, so this will likely grab up a lot of the image-data, too.
+//
+// This function returned the count of preceding bytes.
+func searchAndExtractExifFromReadAtSeeker(r ReadAtSeeker) (exifReadSeeker io.ReadSeeker, discarded int64, err error) {
+	defer func() {
+		if state := recover(); state != nil {
+			err = log.Wrap(state.(error))
+		}
+	}()
+
+	// Search for the beginning of the EXIF information. The EXIF is near the
+	// beginning of most JPEGs, so this likely doesn't have a high cost (at
+	// least, again, with JPEGs).
+
+	window := make([]byte, ExifSignatureLength)
+	for {
+		_, err := r.ReadAt(window, discarded)
+		if err != nil {
+			if err == io.EOF {
+				return nil, 0, ErrNoExif
+			}
+
+			log.Panic(err)
+		}
+
+		_, err = ParseExifHeader(window)
+		if err != nil {
+			if log.Is(err, ErrNoExif) == true {
+				// No EXIF. Move forward by one byte.
+
+				discarded++
+
+				continue
+			}
+
+			// Some other error.
+			log.Panic(err)
+		}
+
+		break
+	}
+
+	exifLogger.Debugf(nil, "Found EXIF blob (%d) bytes from initial position.", discarded)
+
+	exifReadSeeker = &ReaderSeekerWithDiscarded{
+		r:         r,
+		discarded: discarded,
+		off:       0,
+	}
+	r.Seek(discarded, io.SeekStart)
+	return exifReadSeeker, discarded, nil
 }
 
 // RELEASE(dustin): We should replace the implementation of SearchAndExtractExifWithReader with searchAndExtractExifWithReaderWithDiscarded and drop the latter.
